@@ -42,15 +42,21 @@ def fetch_projections_from_sleeper():
             if 'fantasy_positions' in player_info and player_info['fantasy_positions']:
                 positions = player_info['fantasy_positions']
                 if any(pos in POSITIONS for pos in positions):
+                    try:
+                        projection = int(player_info.get('fantasy_data_id', 0))
+                    except (ValueError, TypeError):
+                        projection = 0
+                    
                     projections[player_id] = {
                         'name': player_info.get('full_name', 'Unknown'),
                         'position': positions[0],
-                        'projection': player_info.get('fantasy_data_id', 0)
+                        'projection': projection
                     }
 
         return projections
     else:
         raise Exception(f"Failed to fetch data from Sleeper API: {response.status_code}")
+
 
 def identify_baseline_players(projections):
     baseline_players = {}
@@ -72,9 +78,11 @@ def calculate_vorp(projections, baseline_players):
     
     for player_id, stats in projections.items():
         position = stats['position']
-        vorp_scores[player_id] = stats['projection'] - baseline_players[position]
+        if stats['projection'] is not None:
+            vorp_scores[player_id] = stats['projection'] - baseline_players.get(position, 0)
     
     return vorp_scores
+
 
 def filter_by_team_needs(vorp_scores, projections):
     team_filtered_players = {}
