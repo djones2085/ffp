@@ -1,98 +1,128 @@
 import requests
+import pandas as pd
 
 # Global Constants
-
-# POSITIONS: List of relevant fantasy football positions
-# Used to filter and identify players that are of interest for fantasy projections.
-POSITIONS = ['QB', 'RB', 'WR', 'TE']
-
-# LEAGUE_SIZE: Integer representing the number of teams in the league
-# This determines how many players at each position are considered starters, 
-# which affects baseline player calculations and draft strategies.
+POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF']
 LEAGUE_SIZE = 12
 
-# TEAM_ROSTER_NEEDS: Dictionary mapping each team to a list of positions they need to fill
-# The keys are team names, and the values are lists of positions that the team needs to draft.
-# This is used to filter players based on the specific needs of each team during the draft simulation.
 TEAM_ROSTER_NEEDS = {
-    'Team1': ['RB', 'WR'],   # Team1 needs a Running Back (RB) and a Wide Receiver (WR)
-    'Team2': ['QB', 'TE'],   # Team2 needs a Quarterback (QB) and a Tight End (TE)
-    'MyTeam': ['RB', 'WR', 'TE'],  # MyTeam needs a Running Back, Wide Receiver, and Tight End
+    'Team1': ['RB', 'WR'],
+    'Team2': ['QB', 'TE'],
+    'MyTeam': ['RB', 'WR', 'TE'],
 }
 
-# DRAFTED_PLAYERS: Dictionary mapping each team to a list of player IDs that have already been drafted
-# The keys are team names, and the values are lists of player IDs representing the players that the team has already drafted.
-# This is used during the draft simulation to avoid drafting the same player multiple times.
 DRAFTED_PLAYERS = {
-    'MyTeam': [],   # List of player IDs drafted by MyTeam
-    'Team1': [],    # List of player IDs drafted by Team1
-    'Team2': [],    # List of player IDs drafted by Team2
+    'MyTeam': [],
+    'Team1': [],
+    'Team2': [],
 }
 
+# File path to the Excel file
+file_path = '/Users/danieljones/dev/ffp/utilities/cbs_ff_projection_data.xlsx'
 
-def fetch_projections_from_sleeper():
+# Load and process the Excel file
+# TODO: Handle defense and special teams data ingestion
+def load_and_process_excel(file_path):
+    excel_data = pd.ExcelFile(file_path)
+    cbs_data = pd.concat([pd.read_excel(file_path, sheet_name=sheet) for sheet in excel_data.sheet_names])
+
+    def process_player_data(player):
+        if isinstance(player, str):
+            parts = player.split()
+            if len(parts) >= 4:
+                first_name = parts[0]
+                last_name = parts[1]
+                search_full_name = f"{first_name.lower()}{last_name.lower()}"
+                return search_full_name
+        return pd.NA
+
+    # Apply the function to process player data and add only the search_full_name column
+    cbs_data['search_full_name'] = cbs_data['PLAYER'].apply(process_player_data)
+    
+    # Ensure FPTS is present and correctly processed
+    if 'FPTS' not in cbs_data.columns:
+        raise ValueError("FPTS column not found in the Excel file.")
+    
+    # Drop the 'PLAYER' column after processing
+    cbs_data = cbs_data.drop(columns=['PLAYER'])
+    
+    return cbs_data
+
+# Fetch projections from Sleeper and return as a DataFrame
+def fetch_data_from_sleeper():
     url = "https://api.sleeper.app/v1/players/nfl"
     response = requests.get(url)
     
     if response.status_code == 200:
         data = response.json()
-        projections = {}
-
+        # Create a list to store player data
+        sleeper_data = []
         for player_id, player_info in data.items():
             if 'fantasy_positions' in player_info and player_info['fantasy_positions']:
                 positions = player_info['fantasy_positions']
                 if any(pos in POSITIONS for pos in positions):
-                    try:
-                        projection = int(player_info.get('fantasy_data_id', 0))
-                    except (ValueError, TypeError):
-                        projection = 0
-                    
-                    projections[player_id] = {
-                        'name': player_info.get('full_name', 'Unknown'),
+                    sleeper_data.append({
+                        'player_id': player_id,
+                        'search_full_name': player_info.get('search_full_name', '').lower(),
+                        'full_name': player_info.get('full_name', 'Unknown'),
                         'position': positions[0],
-                        'projection': projection
-                    }
-
-        return projections
+                        'team': player_info.get('team', '')
+                    })
+        
+        # Convert the list to a DataFrame
+        sleeper_df = pd.DataFrame(sleeper_data)
+        return sleeper_df
     else:
         raise Exception(f"Failed to fetch data from Sleeper API: {response.status_code}")
 
+# Merge Excel data with Sleeper data
+def merge_data(cbs_data, sleeper_data):
+    # Merge the Excel data with the Sleeper data on 'search_full_name'
+    merged_data = pd.merge(cbs_data, sleeper_data, on='search_full_name', how='left', suffixes=('', '_sleeper'))
+    
+    # Ensure FPTS column is retained correctly
+    if 'FPTS' not in merged_data.columns:
+        raise ValueError("FPTS column is missing after merging data.")
+    
+    return merged_data
 
-def identify_baseline_players(projections):
-    baseline_players = {}
+# Identify baseline players using the DataFrame directly
+def identify_baseline_players(merged_data_df):
+    baseline_players_points = {}
     
     for position in POSITIONS:
-        players_in_position = [player for player in projections.values() if player['position'] == position]
-        players_in_position.sort(key=lambda x: x['projection'], reverse=True)
+        players_in_position = merged_data_df[merged_data_df['position'] == position]
+        players_in_position = players_in_position.sort_values(by='FPTS', ascending=False)
         
-        if len(players_in_position) > 0:
+        if not players_in_position.empty:
             baseline_index = min(LEAGUE_SIZE - 1, len(players_in_position) - 1)
-            baseline_players[position] = players_in_position[baseline_index]['projection']
+            baseline_players_points[position] = float(players_in_position.iloc[baseline_index]['FPTS'])
         else:
-            baseline_players[position] = 0
+            baseline_players_points[position] = 0.0  # Ensure the default is a standard float
 
-    return baseline_players
+    return baseline_players_points
 
-def calculate_vorp(projections, baseline_players):
-    vorp_scores = {}
-    
-    for player_id, stats in projections.items():
-        position = stats['position']
-        if stats['projection'] is not None:
-            vorp_scores[player_id] = stats['projection'] - baseline_players.get(position, 0)
-    
+# Calculate VORP using the DataFrame directly
+def calculate_vorp(df, baseline_players):
+    df['VORP'] = df.apply(lambda row: row['FPTS'] - baseline_players.get(row['position'], 0), axis=1)
+    vorp_scores = df.set_index('search_full_name')['VORP'].to_dict()
     return vorp_scores
 
-
-def filter_by_team_needs(vorp_scores, projections):
+# Filter by team needs
+def filter_by_team_needs(vorp_scores, sleeper_data):
     team_filtered_players = {}
     
     for team, needs in TEAM_ROSTER_NEEDS.items():
-        team_filtered_players[team] = {player: vorp_scores[player] for player in vorp_scores if projections[player]['position'] in needs}
+        team_filtered_players[team] = {
+            player_id: vorp_scores[player_id] 
+            for player_id in vorp_scores 
+            if sleeper_data[sleeper_data['player_id'] == player_id]['position'].values[0] in needs
+        }
     
     return team_filtered_players
 
-def simulate_draft_for_all_teams(vorp_scores, projections, filtered_team_vorp_scores):
+# Simulate draft for all teams
+def simulate_draft_for_all_teams(vorp_scores, sleeper_data, filtered_team_vorp_scores, df):
     simulated_draft_results = {}
     
     for team, filtered_scores in filtered_team_vorp_scores.items():
@@ -105,21 +135,25 @@ def simulate_draft_for_all_teams(vorp_scores, projections, filtered_team_vorp_sc
         max_total_points = 0
         best_pick = None
 
-        for player, vorp in filtered_scores.items():
-            if player not in current_team:
+        for player_id, vorp in filtered_scores.items():
+            if player_id not in current_team:
                 simulated_team = current_team.copy()
-                simulated_team.append(player)
+                simulated_team.append(player_id)
 
                 for position in team_needs:
-                    if position not in [projections[p]['position'] for p in simulated_team]:
-                        remaining_players = {p: v for p, v in vorp_scores.items() if projections[p]['position'] == position}
+                    if position not in sleeper_data[sleeper_data['player_id'].isin(simulated_team)]['position'].tolist():
+                        remaining_players = {
+                            p: v for p, v in vorp_scores.items() 
+                            if sleeper_data[sleeper_data['player_id'] == p]['position'].values[0] == position
+                        }
                         best_remaining = max(remaining_players, key=remaining_players.get)
                         simulated_team.append(best_remaining)
 
-                total_points = sum([projections[p]['projection'] for p in simulated_team])
+                # Calculate total points using the FPTS values from df
+                total_points = sum([df.loc[df['player_id'] == p, 'FPTS'].values[0] for p in simulated_team])
                 if total_points > max_total_points:
                     max_total_points = total_points
-                    best_pick = player
+                    best_pick = player_id
 
         simulated_draft_results[team] = {
             'best_pick': best_pick,
@@ -128,6 +162,7 @@ def simulate_draft_for_all_teams(vorp_scores, projections, filtered_team_vorp_sc
 
     return simulated_draft_results
 
+# Choose the best pick
 def choose_best_pick(simulated_draft_results):
     my_team_results = simulated_draft_results['MyTeam']
     best_pick = my_team_results['best_pick']
@@ -135,31 +170,55 @@ def choose_best_pick(simulated_draft_results):
     
     return best_pick, best_total_points
 
+# Main function
 def main():
     try:
-        projections = fetch_projections_from_sleeper()
-        print("Projections fetched successfully!")
+        # Load and process the Excel file
+        cbs_data = load_and_process_excel(file_path)
+        print("Excel data loaded and processed successfully!")
+        # # Print the first few rows of the DataFrame
+        # print(cbs_data.head())
+    except Exception as e:
+        print(f"Error loading or processing Excel data: {e}")
+        return
+
+    try:
+        sleeper_data = fetch_data_from_sleeper()
+        print("Sleeper data fetched successfully!")
+        # # Print the first few rows of the DataFrame
+        # print(sleeper_data.head())
     except Exception as e:
         print(f"Error fetching projections: {e}")
         return
     
     try:
-        baseline_players = identify_baseline_players(projections)
-        vorp_scores = calculate_vorp(projections, baseline_players)
+        merged_data = merge_data(cbs_data, sleeper_data)
+        print("Data merged successfully!")
+        # # Print the first few rows of the DataFrame
+        # print(merged_data.head())
+    except Exception as e:
+        print(f"Error merging data: {e}")
+        return
+
+    try:
+        baseline_players = identify_baseline_players(merged_data)
+        # Print the baseline players
+        print(baseline_players)
+        vorp_scores = calculate_vorp(merged_data, baseline_players)
         print("VORP Scores calculated successfully!")
     except Exception as e:
         print(f"Error calculating VORP scores: {e}")
         return
 
     try:
-        filtered_team_vorp_scores = filter_by_team_needs(vorp_scores, projections)
+        filtered_team_vorp_scores = filter_by_team_needs(vorp_scores, sleeper_data)
         print("Filtered VORP Scores by Team Needs:")
     except Exception as e:
         print(f"Error filtering by team needs: {e}")
         return
 
     try:
-        simulated_draft_results = simulate_draft_for_all_teams(vorp_scores, projections, filtered_team_vorp_scores)
+        simulated_draft_results = simulate_draft_for_all_teams(vorp_scores, sleeper_data, filtered_team_vorp_scores, merged_data)
         print("Simulated Draft Results:")
     except Exception as e:
         print(f"Error simulating draft: {e}")
