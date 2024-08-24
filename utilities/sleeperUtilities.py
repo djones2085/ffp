@@ -3,7 +3,7 @@ import pandas as pd
 
 # Global Constants
 POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF']
-LEAGUE_SIZE = 12
+LEAGUE_SIZE = 10
 
 TEAM_ROSTER_NEEDS = {
     'Team1': ['RB', 'WR'],
@@ -17,27 +17,68 @@ DRAFTED_PLAYERS = {
     'Team2': [],
 }
 
+TEAM_NAME_MAPPING = {
+    'HOU': 'Houston',
+    'NE': 'New England',
+    'BAL': 'Baltimore',
+    'PIT': 'Pittsburgh',
+    'IND': 'Indianapolis',
+    'ARI': 'Arizona',
+    'SEA': 'Seattle',
+    'LV': 'Las Vegas',
+    'NYJ': 'N.Y. Jets',
+    'DAL': 'Dallas',
+    'WAS': 'Washington',
+    'LAC': 'L.A. Chargers',
+    'TB': 'Tampa Bay',
+    'CLE': 'Cleveland',
+    'ATL': 'Atlanta',
+    'CAR': 'Carolina',
+    'JAX': 'Jacksonville',
+    'LAR': 'L.A. Rams',
+    'NO': 'New Orleans',
+    'GB': 'Green Bay',
+    'MIA': 'Miami',
+    'DET': 'Detroit',
+    'BUF': 'Buffalo',
+    'PHI': 'Philadelphia',
+    'SF': 'San Francisco',
+    'NYG': 'N.Y. Giants',
+    'TEN': 'Tennessee',
+    'CHI': 'Chicago',
+    'CIN': 'Cincinnati',
+    'DEN': 'Denver',
+    'KC': 'Kansas City',
+    'MIN': 'Minnesota'
+}
+
 # File path to the Excel file
 file_path = '/Users/danieljones/dev/ffp/utilities/cbs_ff_projection_data.xlsx'
 
 # Load and process the Excel file
-# TODO: Handle defense and special teams data ingestion
 def load_and_process_excel(file_path):
     excel_data = pd.ExcelFile(file_path)
     cbs_data = pd.concat([pd.read_excel(file_path, sheet_name=sheet) for sheet in excel_data.sheet_names])
 
-    def process_player_data(player):
-        if isinstance(player, str):
-            parts = player.split()
+    def process_row(row):
+        if pd.notna(row.get('PLAYER')):  # Process as a player
+            parts = row['PLAYER'].split()
             if len(parts) >= 4:
                 first_name = parts[0]
                 last_name = parts[1]
                 search_full_name = f"{first_name.lower()}{last_name.lower()}"
-                return search_full_name
-        return pd.NA
+                return pd.Series([search_full_name, None])
+        elif pd.notna(row.get('TEAM')):  # Process as a defense/special team
+            team_name = row['TEAM']
+            # Map the CBS team name to the Sleeper team abbreviation and use it to search the player_id
+            for player_id, cbs_team in TEAM_NAME_MAPPING.items():
+                if cbs_team == team_name:
+                    mapped_team_name = player_id.lower()
+                    return pd.Series([None, mapped_team_name])
+        return pd.Series([pd.NA, pd.NA])
 
-    # Apply the function to process player data and add only the search_full_name column
-    cbs_data['search_full_name'] = cbs_data['PLAYER'].apply(process_player_data)
+    # Apply the function to process each row and add the relevant identifier columns
+    cbs_data[['search_full_name', 'search_team_name']] = cbs_data.apply(process_row, axis=1)
     
     # Ensure FPTS is present and correctly processed
     if 'FPTS' not in cbs_data.columns:
@@ -61,12 +102,17 @@ def fetch_data_from_sleeper():
             if 'fantasy_positions' in player_info and player_info['fantasy_positions']:
                 positions = player_info['fantasy_positions']
                 if any(pos in POSITIONS for pos in positions):
+                    # Safely handle None values before calling .lower() and convert team names to uppercase
+                    search_full_name = player_info.get('search_full_name', '')
+                    full_name = player_info.get('full_name', 'Unknown')
+                    team = player_info.get('team', '').upper() if player_info.get('team') else ''
+                    
                     sleeper_data.append({
-                        'player_id': player_id,
-                        'search_full_name': player_info.get('search_full_name', '').lower(),
-                        'full_name': player_info.get('full_name', 'Unknown'),
+                        'player_id': player_id.lower(),
+                        'search_full_name': search_full_name.lower() if search_full_name else '',
+                        'full_name': full_name,
                         'position': positions[0],
-                        'team': player_info.get('team', '')
+                        'team': team  # Convert to uppercase for consistency
                     })
         
         # Convert the list to a DataFrame
@@ -75,16 +121,69 @@ def fetch_data_from_sleeper():
     else:
         raise Exception(f"Failed to fetch data from Sleeper API: {response.status_code}")
 
-# Merge Excel data with Sleeper data
 def merge_data(cbs_data, sleeper_data):
-    # Merge the Excel data with the Sleeper data on 'search_full_name'
-    merged_data = pd.merge(cbs_data, sleeper_data, on='search_full_name', how='left', suffixes=('', '_sleeper'))
+    # Standardize team names to uppercase
+    cbs_data['search_team_name'] = cbs_data['search_team_name'].str.upper()
+    sleeper_data['team'] = sleeper_data['team'].str.upper()
     
-    # Ensure FPTS column is retained correctly
-    if 'FPTS' not in merged_data.columns:
+    # Debug: print the dataframes before merging
+    print("CBS Data before merging:")
+    print(cbs_data.head())
+    print("Sleeper Data before merging:")
+    print(sleeper_data.head())
+    
+    # Merge on players using 'search_full_name' for positions other than 'DEF'
+    player_merge = pd.merge(cbs_data[cbs_data['search_full_name'].notna()], sleeper_data, 
+                            left_on='search_full_name', right_on='search_full_name', 
+                            how='left', suffixes=('', '_sleeper'))
+
+    # Debug: print the merged data
+    print("Player Merge:")
+    print(player_merge.head())
+    
+    # Merge on team defenses using 'team' for rows where position is 'DEF'
+    def_merge = pd.merge(cbs_data[cbs_data['search_team_name'].notna()], sleeper_data[sleeper_data['position'] == 'DEF'], 
+                         left_on='search_team_name', right_on='team', 
+                         how='left', suffixes=('', '_team'))
+
+    # Debug: print the merged data for DEF
+    print("DEF Merge:")
+    print(def_merge.head())
+
+    # Concatenate both merged DataFrames
+    combined_merge = pd.concat([player_merge, def_merge], ignore_index=True)
+
+    # Ensure that we have a single FPTS column
+    if 'FPTS' not in combined_merge.columns:
         raise ValueError("FPTS column is missing after merging data.")
     
-    return merged_data
+    # Clean up any unnecessary columns
+    columns_to_drop = ['search_full_name_team', 'search_team_name', 'player_id_team', 'full_name_team', 'position_team', 'team_team']
+    existing_columns_to_drop = [col for col in columns_to_drop if col in combined_merge.columns]
+    
+    result = combined_merge.drop(columns=existing_columns_to_drop)
+    
+    # Debug: print the final combined data
+    print("Final Combined Data:")
+    print(result.head())
+    
+    return result
+
+# Filter by team needs
+def filter_by_team_needs(vorp_scores, sleeper_data):
+    team_filtered_players = {}
+    
+    for team, needs in TEAM_ROSTER_NEEDS.items():
+        team_filtered_players[team] = {
+            player_id: vorp_scores[player_id]
+            for player_id in vorp_scores
+            if sleeper_data[sleeper_data['player_id'] == player_id]['position'].values[0] in needs
+        }
+
+        if not team_filtered_players[team]:  # Check if filtering resulted in an empty dictionary
+            print(f"Warning: No players found for team {team} based on needs {needs}")
+
+    return team_filtered_players
 
 # Identify baseline players using the DataFrame directly
 def identify_baseline_players(merged_data_df):
@@ -170,14 +269,12 @@ def choose_best_pick(simulated_draft_results):
     
     return best_pick, best_total_points
 
-# Main function
 def main():
     try:
         # Load and process the Excel file
         cbs_data = load_and_process_excel(file_path)
         print("Excel data loaded and processed successfully!")
-        # # Print the first few rows of the DataFrame
-        # print(cbs_data.head())
+        print(cbs_data.head())
     except Exception as e:
         print(f"Error loading or processing Excel data: {e}")
         return
@@ -185,8 +282,7 @@ def main():
     try:
         sleeper_data = fetch_data_from_sleeper()
         print("Sleeper data fetched successfully!")
-        # # Print the first few rows of the DataFrame
-        # print(sleeper_data.head())
+        print(sleeper_data.head())
     except Exception as e:
         print(f"Error fetching projections: {e}")
         return
@@ -194,15 +290,24 @@ def main():
     try:
         merged_data = merge_data(cbs_data, sleeper_data)
         print("Data merged successfully!")
-        # # Print the first few rows of the DataFrame
-        # print(merged_data.head())
+        print(merged_data.head())
     except Exception as e:
         print(f"Error merging data: {e}")
         return
 
     try:
+        # Identify and print rows with 'DEF' as the position
+        def_rows = merged_data[merged_data['position'] == 'DEF']
+        if def_rows.empty:
+            print("No rows found with position 'DEF'.")
+            team_rows = merged_data[merged_data['team'].notna()]
+            print("Rows with non-null 'team' field, possibly DEF teams:")
+            print(team_rows[['team', 'position', 'player_id', 'full_name']].head(10))
+        else:
+            print("Rows with position 'DEF':")
+            print(def_rows)
+
         baseline_players = identify_baseline_players(merged_data)
-        # Print the baseline players
         print(baseline_players)
         vorp_scores = calculate_vorp(merged_data, baseline_players)
         print("VORP Scores calculated successfully!")
